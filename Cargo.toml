@@ -1,0 +1,17 @@
+[package]
+name = "fernbedienung"
+version = "0.1.0"
+authors = ["Michael Allwright <allsey87@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "0.3", features = ["full"] }
+tokio-util = { version = "0.5", features = ["full"] }
+tokio-serde = { version = "0.7", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+bytes = { version = "0.6" }
+futures = { version = "0.3.0"}
+serde_json = { version = "1.0"}
+thiserror = { version = "1.0" }
