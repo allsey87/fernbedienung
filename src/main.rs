@@ -6,14 +6,14 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use futures::{stream::FuturesUnordered, prelude::*};
+use futures::{prelude::*, stream::FuturesUnordered};
 
 use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt};
 use tokio_serde::formats::SymmetricalJson;
-use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use tokio_util::codec::{Decoder, FramedRead, FramedWrite, LengthDelimitedCodec};
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BytesMut};
 
 // Important: tokio::stream::Stream is a reexport of futures::stream::Stream, however, both libraries have different versions of
 // StreamExt
@@ -57,12 +57,17 @@ enum Request {
     Kill(u32),
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+enum Source {
+    StandardOutput,
+    StandardError,
+}
+
 #[derive(Debug, Serialize)]
 enum Response {
     Ok,
     Error(String),
-    StdErr(u32, Vec<u8>),
-    StdOut(u32, Vec<u8>),
+    Output(u32, Source, BytesMut),
 }
 
 impl<T, E: std::fmt::Display> std::convert::From<Result<T, E>> for Response {
@@ -74,35 +79,79 @@ impl<T, E: std::fmt::Display> std::convert::From<Result<T, E>> for Response {
     }
 }
 
+struct ProcessCodec(u32, Source);
+
+impl ProcessCodec {
+    fn new(pid: u32, source: Source) -> ProcessCodec {
+        ProcessCodec(pid, source)
+    }
+}
+
+impl Decoder for ProcessCodec {
+    type Item = Response;
+    type Error = io::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Response>, io::Error> {
+        if !buf.is_empty() {
+            let length = buf.len();
+            let response = Response::Output(self.0, self.1, buf.split_to(length));
+            Ok(Some(response))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+
 // Since output on stdout, stderr is async and can happen at anytime, we probably need a mpsc channel
 // for writing back to the client
 
 // is it possible to wrap up the ChildStdout, a BufMut, the code to split etc into a async functor that returns bytes?
 // This future would never complete and would require channels to get data in and out, but that could be ok?
-enum ProcessResp {
-    Status(usize), // PID
-    StdErr,
-    StdOut,
-}
-
 
 #[tokio::main]
 pub async fn main() {
     // Bind a server socket
-    let mut listener = TcpListener::bind("127.0.0.1:17653").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:17653").await.unwrap();
 
     println!("listening on {:?}", listener.local_addr());
 
-    
-    while let Some(mut socket) = listener.try_next().await.unwrap() {
-        
+    loop {
+        let (mut socket, _peer_addr) = listener.accept().await.unwrap();
+
         tokio::spawn(async move {
             // by having this map only in the scope of this task, it is not possible
             // for different clients to access each others processes in general this
             // adds security, but would prevent regaining control over processes after
             // disconnects
+            // TODO security isn't important for this application, move this hashmap out
+            // of the client and protect with RwLock?
             let mut processes : HashMap<u32, tokio::process::Child> = HashMap::new();
-            
+
+            /*
+            Two approaches:
+            HashMap<id, child>
+                - easy access from the request loops, processes.get_mut().kill() etc
+                - stdout/stderr? need to be made into streams (requires move or mutable borrow, conflicts with)
+                - FramedRead::new(my_async_read, BytesCodec::new());
+
+            FuturesUnordered<[...async...]>
+                - access from the request loop is a bit more complicated
+                - in the main loop, we would have HashMap<id, tx_pipe>
+                    - either a hashmap+pipe for each operation, e.g., write,kill
+                    - single hashmap+pipe per process that forwards the tx related requests?
+                        - Write(u32, Vec<u8>), Kill(u32): note the u32 could be dropped/no longer makes sense
+                        - A new type would be needed e.g., ProcessRequest
+                - inside the [..async..] block we would handle all process related actions, essentially
+                  there would be a big select! statement in a loop that waits for a ProcessRequest from the rx end
+                  of the pipe
+                - how to push data from stderr and stdout back to client?
+                - the problem here is that this [...async...] should not resolve until the process has terminated,
+                  since yield is experimental, we should use pipes to get data out of the async closure
+                - the rx end of these pipes need to be near the response loop so that we can generate responses
+
+            */
+
             let (recv, send) = socket.split();
                 
             // Deserialize frames
@@ -111,12 +160,16 @@ pub async fn main() {
                 SymmetricalJson::<Request>::default(),
             );
 
-            let mut responses = tokio_serde::SymmetricallyFramed::new(
+            let responses = tokio_serde::SymmetricallyFramed::new(
                 FramedWrite::new(send, LengthDelimitedCodec::new()),
                 SymmetricalJson::<Response>::default(),
             );
 
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Response>();
+            let (mut tx, rx) = futures::channel::mpsc::unbounded::<Response>();
+            //tokio::sync::mpsc::unbounded_channel::<Response>();
+
+            
+
 
             // everything that needs to go back to the server goes through the above channel
             // the following tasks need to be concurrently awaited on
@@ -127,9 +180,15 @@ pub async fn main() {
             // 4* It may be possible to use a FuturesUnordered collection to poll all the
             // running processes
 
-            let tasks = FuturesUnordered::new();
+            // the futures in this collection are waiting on stdout and stderr to produce data
+            // this collection needs to be polled at the same level as requests. The result of
+            // both a request and a stdout/stderr event is returning a response
+            
             
             let result = tokio::join!(rx.map(|msg| Ok(msg)).forward(responses), async {
+                let stdout_streams = FuturesUnordered::new();
+                let stderr_streams = FuturesUnordered::new();
+
                 while let Some(msg) = requests.try_next().await.unwrap() {
                     let response = match msg {
                         Request::Ping => Response::Ok,
@@ -141,14 +200,17 @@ pub async fn main() {
                                 .into()
                         },
                         Request::Write(id, data) => {
-                            let f = processes.get_mut(&id)
-                                .ok_or(io::Error::new(io::ErrorKind::NotFound, "No such process"))
-                                .and_then(|process| process.stdin
-                                    .as_mut()
-                                    .ok_or(io::Error::new(io::ErrorKind::BrokenPipe, "Standard input unavailable")))
-                                .map(|p| p.write_all(&data));
-                            
-                            Response::Ok
+                            let t = processes.get_mut(&id)
+                            .ok_or(io::Error::new(io::ErrorKind::NotFound, "No such process"))
+                            .and_then(|process| process.stdin
+                                .as_mut()
+                                .ok_or(io::Error::new(io::ErrorKind::BrokenPipe, "Standard input unavailable")));
+
+                            match t {
+                                /* match against the result of getting the child's stdin */
+                                Ok(stdin) => stdin.write_all(&data).await.into(),
+                                Err(error) => Err::<(), io::Error>(error).into(),
+                            }
                         },
                         Request::Kill(id) => {
                             processes.get_mut(&id)
@@ -164,6 +226,8 @@ pub async fn main() {
                                 .stderr(std::process::Stdio::piped())
                                 .stdin(std::process::Stdio::piped())
                                 .spawn()
+                                // TODO: don't unwrap here, return the error if the process did not
+                                // start
                                 .unwrap();
 
                             if let Some(id) = process.id() {
@@ -172,56 +236,54 @@ pub async fn main() {
                                 // each process contains a select statement on read/write/kill/wait
                                 // start each process on its own tokio thread, use channels to R/W
                                 
-                                let tx_clone = tx.clone();
+                                //let stderr = process.stderr.as_mut().unwrap();
+                                //let stdin = process.stdin.as_mut().unwrap();
 
-                                // current approach is to move stdout and stderr away from their process and put them
-                                // in this closure, so that the process can be put into a vector which can then be
-                                // killed, written to etc
+                                // this bytescodec is insufficient since it doesn't include the process id
+                                // etc, it would be better if the codec generated a Response or ProcessResp directly
                                 
-                                let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-                                // alternatively, we can move the process itself inside of this async block, and use
-                                // channels to handle write/kill
-                                tasks.push(async move {
-                                    let stdout = process.stdout.as_mut().unwrap();
-                                    let stderr = process.stderr.as_mut().unwrap();
-                                    let stdin = process.stdin.as_mut().unwrap();
-
-                                    let test = stdin_rx.map(|data| Ok(data.as_ref())).forward(stdin);
-
-                                    let mut stdout_buffer = BytesMut::new();
-                                    let mut stderr_buffer = BytesMut::new();
-                                    loop {
-                                        tokio::select!{
-                                            Ok(_) = stdout.read_buf(&mut stdout_buffer) => {
-                                                // if tx_clone implements sink, 
-                                                let response = Response::StdOut(id, stdout_buffer.split().to_vec());
-                                                if let Err(_) = tx_clone.send(response) {
-                                                    /* this error implies that the rx end was closed or dropped */
-                                                    /* exit this loop so that this future resolves */
-                                                    break;
-                                                }
-                                            },
-                                            Ok(_) = stderr.read_buf(&mut stderr_buffer) => {
-                                                let response = Response::StdErr(id, stderr_buffer.split().to_vec());
-                                                if let Err(_) = tx_clone.send(response) {
-                                                    /* this error implies that the rx end was closed or dropped */
-                                                    /* exit this loop so that this future resolves */
-                                                    break;
-                                                }
-                                            }
-                                            
-                                        }
-                                    }
-                                });
-
+                                let stdout = process.stdout.take().unwrap();
+                                let stderr = process.stderr.take().unwrap();
+                                let stdout_stream = FramedRead::new(stdout, ProcessCodec::new(id, Source::StandardOutput));
+                                let stderr_stream = FramedRead::new(stderr, ProcessCodec::new(id, Source::StandardError));
+                                //FramedRead::new(stderr, BytesCodec::new());
                                 // two futuresunordered may be necessary, one for the stderr, one for stdout
+                                // then tokio::select! over the two future collections and the received messages
+
+                                // tx is UnboundedSender<Response> of the futures::channel::mpsc::unbounded::<Response>();
+                                // changed to the futures channel since it implements sink
+                                // items from stdout stream are Option<Result<Response, Error>>
+                                // we need to map, convert this, first question is what is forward expecting?
+                                // Forward is expecting something that implements TryStream
+                                // TryStream has a blanket implementation over any Stream whose Item = Result<T,E>
+                                // FramedRead implements Stream, perhaps the problem here is the Option?
+
+                                //let tx = tx.sink_map_err(|e| e);
+                                let stdout_forward = stdout_stream.forward(
+                                    tx.clone().sink_map_err(|inner| {
+                                        io::Error::new(io::ErrorKind::BrokenPipe, inner)
+                                    })
+                                );
+                                stdout_streams.push(stdout_forward);
+
+                                let stderr_forward = stderr_stream.forward(
+                                    tx.clone().sink_map_err(|inner| {
+                                        io::Error::new(io::ErrorKind::BrokenPipe, inner)
+                                    })
+                                );
+                                stderr_streams.push(stderr_forward);
+
+
+                                // place the child into the map so that we can kill it/write to stdin
+                                processes.insert(id, process);
+
+                                
                             }
                             Response::Ok
                         },
                     };
 
-                    if let Err(error) = tx.send(response) {
+                    if let Err(error) = tx.send(response).await {
                         eprintln!("Error = {}", error);
                     }
                 }
