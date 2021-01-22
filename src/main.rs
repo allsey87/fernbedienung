@@ -6,11 +6,11 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use futures::{prelude::*, stream::FuturesUnordered};
+use futures::{prelude::*, stream::FuturesUnordered, channel::mpsc::{UnboundedSender, UnboundedReceiver}};
 
 use tokio::net::TcpListener;
 use tokio::io::{AsyncWriteExt};
-use tokio_serde::formats::SymmetricalJson;
+use tokio_serde::{SymmetricallyFramed, formats::SymmetricalJson};
 use tokio_util::codec::{Decoder, FramedRead, FramedWrite, LengthDelimitedCodec};
 
 use bytes::{BytesMut};
@@ -34,19 +34,24 @@ enum Request {
     Ping,
     Upload(Upload),
     Run(Run),
-    Write(u32, Vec<u8>),
-    Kill(u32),
+    Process(u32, ProcessReq),
+}
+
+#[derive(Debug, Deserialize)]
+enum ProcessReq {
+    Write(Vec<u8>),
+    Kill,
 }
 
 #[derive(Debug, Serialize)]
 enum Response {
     Ok,
     Error(String),
-    Process(u32, Process),
+    Process(u32, ProcessResp),
 }
 
 #[derive(Debug, Serialize)]
-enum Process {
+enum ProcessResp {
     Started,
     Terminated(usize),
     Output(Source, BytesMut),
@@ -82,7 +87,7 @@ impl Decoder for ProcessCodec {
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Response>, io::Error> {
         if !buf.is_empty() {
             let length = buf.len();
-            let response = Response::Process(self.0, Process::Output(self.1, buf.split_to(length)));
+            let response = Response::Process(self.0, ProcessResp::Output(self.1, buf.split_to(length)));
             Ok(Some(response))
         } else {
             Ok(None)
@@ -105,17 +110,18 @@ pub async fn main() {
         tokio::spawn(async move {
             // TODO security isn't important for this application, move this hashmap out
             // of the client and protect with RwLock?
-            let mut processes : HashMap<u32, tokio::process::Child> = HashMap::new();
+            let mut process_tx : HashMap<u32, UnboundedSender<ProcessReq>> = HashMap::new();
+            let mut processes = FuturesUnordered::new();
 
             let (recv, send) = socket.split();
                 
             // Deserialize frames
-            let mut requests = tokio_serde::SymmetricallyFramed::new(
+            let mut requests = SymmetricallyFramed::new(
                 FramedRead::new(recv, LengthDelimitedCodec::new()),
                 SymmetricalJson::<Request>::default(),
             );
 
-            let responses = tokio_serde::SymmetricallyFramed::new(
+            let responses = SymmetricallyFramed::new(
                 FramedWrite::new(send, LengthDelimitedCodec::new()),
                 SymmetricalJson::<Response>::default(),
             );
@@ -123,16 +129,16 @@ pub async fn main() {
             let (mut tx, rx) = futures::channel::mpsc::unbounded::<Response>();
             
             let mut multiplex_encode_task = rx.map(|message| Ok(message)).forward(responses);
-            let mut forward_stdout_tasks = FuturesUnordered::new();
-            let mut forward_stderr_tasks = FuturesUnordered::new();
 
             loop {
                 tokio::select! {
-                    Err(error) = forward_stderr_tasks.try_next() => {
-                        log::error!("forward_stderr_tasks: {:?}", error);
-                    },
-                    Err(error) = forward_stdout_tasks.try_next() => {
-                        log::error!("forward_stdout_tasks: {:?}", error);
+                    Some((id, _exit_result)) = processes.next() => {
+                        process_tx.remove(&id);
+                        // todo, exit result is not necessarily ok
+                        let response = Response::Process(id, ProcessResp::Terminated(0));
+                        if let Err(error) = tx.send(response).await {
+                            log::error!("Failed to send terminate message to client: {}", error);
+                        }
                     },
                     result = &mut multiplex_encode_task => {
                         log::warn!("multiplex_encode_task: {:?}", result);
@@ -151,26 +157,21 @@ pub async fn main() {
                                     .and_then(|_| tokio::fs::write(&file_path, &contents)).await
                                     .into()
                             },
-                            Request::Write(id, data) => {
-                                log::info!("[{}] Wrote to process {}", peer_addr, id);
-                                let t = processes.get_mut(&id)
-                                .ok_or(io::Error::new(io::ErrorKind::NotFound, "No such process"))
-                                .and_then(|process| process.stdin
-                                    .as_mut()
-                                    .ok_or(io::Error::new(io::ErrorKind::BrokenPipe, "Standard input unavailable")));
-
-                                match t {
-                                    /* match against the result of getting the child's stdin */
-                                    Ok(stdin) => stdin.write_all(&data).await.into(),
-                                    Err(error) => Err::<(), io::Error>(error).into(),
+                            Request::Process(id, request) => {
+                                log::info!("[{}] request to process {}, {:?}", peer_addr, id, request);
+                                match process_tx.get_mut(&id) {
+                                    Some(process_tx) => {
+                                        match process_tx.send(request).await {
+                                            Ok(_) => Response::Ok,
+                                            Err(_) => Response::Error("Could not communicate with process".to_owned())
+                                        }
+                                        // send back ok for now, alternatively another pipe would have to be constructed
+                                        // and added to map to allow two way communciation. Alternatively, we could
+                                        // just not send anything back, and let the process respond
+                                    },
+                                    None => Response::Error("No such process".to_owned())
                                 }
-                            },
-                            Request::Kill(id) => {
-                                processes.get_mut(&id)
-                                    .ok_or(io::Error::new(io::ErrorKind::NotFound, "No such process"))
-                                    .and_then(tokio::process::Child::start_kill)
-                                    .into()
-                            },
+                            }
                             Request::Run(run) => {
                                 let mut process = tokio::process::Command::new(run.target)
                                     .current_dir(run.working_dir)
@@ -184,62 +185,51 @@ pub async fn main() {
                                     .unwrap();
 
                                 if let Some(id) = process.id() {
-                                    // create a single async block here that handles all process IO?
-                                    // channels for reading, writing, killing, waiting
-                                    // something like this in main loop
-                                    let tprocesses = FuturesUnordered::new();
-                                    enum ProcessRequest {
-                                        Write(Vec<u8>),
-                                        Kill,
-                                    }
-
-                                    let (_, mut proc_rx) : (_, futures::channel::mpsc::UnboundedReceiver<ProcessRequest>)
-                                    
-                                        = futures::channel::mpsc::unbounded::<ProcessRequest>();
-                                    
-                                    // using a single async block here should make the instances compatible
-                                    tprocesses.push(async move {
-                                        match proc_rx.next().await {
-                                            None => {}
-                                            Some(message) => match message {
-                                                ProcessRequest::Write(_data) => {},
-                                                ProcessRequest::Kill => {}
-                                            }
-
-                                        }
-                                        //tokio::select! proc_rx.next for write, kill
-
-                                    });
-
-
-
-                                    
-
                                     let stdout = process.stdout.take().unwrap();
                                     let stdout_stream = FramedRead::new(stdout, ProcessCodec::new(id, Source::Stdout));
                                     let stdout_forward = stdout_stream.forward(
                                         tx.clone().sink_map_err(|inner| {
                                             io::Error::new(io::ErrorKind::BrokenPipe, inner)
                                         })
-                                    );
-                                    forward_stdout_tasks.push(stdout_forward);
-
+                                    ).fuse();
                                     let stderr = process.stderr.take().unwrap();
                                     let stderr_stream = FramedRead::new(stderr, ProcessCodec::new(id, Source::Stderr));
                                     let stderr_forward = stderr_stream.forward(
                                         tx.clone().sink_map_err(|inner| {
                                             io::Error::new(io::ErrorKind::BrokenPipe, inner)
                                         })
-                                    );
-                                    forward_stderr_tasks.push(stderr_forward);
+                                    ).fuse();
+                                    let (proc_tx, mut proc_rx) = futures::channel::mpsc::unbounded::<ProcessReq>();
 
-                                    //let terminate = process.wait();
+                                    processes.push(async move {
+                                        tokio::pin!(stdout_forward);
+                                        tokio::pin!(stderr_forward);
+                                        let exit_result = loop {
+                                            tokio::select! {
+                                                Some(message) = proc_rx.next() => match message {
+                                                    // todo write to stdin
+                                                    ProcessReq::Write(_data) => {},
+                                                    ProcessReq::Kill => { 
+                                                        process.kill().await.expect("kill failed");
+                                                    }
+                                                },
+                                                _ = &mut stdout_forward => {
+                                                    // problem: stdout does not always complete before
+                                                    // wait does
+                                                    log::info!("stdout forward completed")
+                                                },
+                                                _ = &mut stderr_forward => {
+                                                    log::info!("stderr forward completed")
+                                                },
+                                                // note take out stdin!
+                                                exit_result = process.wait() => break exit_result,
+                                            }
+                                        };
+                                        (id, exit_result)
+                                    });
+                                    process_tx.insert(id, proc_tx);
 
-
-                                    // place the child into the map so that we can kill it/write to stdin
-                                    processes.insert(id, process);
-
-                                    Response::Process(id, Process::Started)
+                                    Response::Process(id, ProcessResp::Started)
                                 }
                                 else {
                                     Response::Error("Something went wrong".to_owned())
