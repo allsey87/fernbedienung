@@ -15,3 +15,4 @@ serde = { version = "1.0", features = ["derive"] }
 bytes = { version = "1.0", features = ["serde"] }
 log = { version = "0.4" }
 env_logger = { version = "0.8" }
+uuid = { version = "0.8", features = ["serde", "v3", "v4"] }
