@@ -1,59 +1,43 @@
 #![warn(rust_2018_idioms)]
 
-use std::path::PathBuf;
-use std::collections::HashMap;
-use std::io;
-
+use futures::{prelude::*, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
-
-use futures::{channel::mpsc::UnboundedSender, future::FusedFuture, prelude::*, stream::FuturesUnordered};
-
-use tokio::net::TcpListener;
-use tokio::io::AsyncWriteExt;
+use std::path::PathBuf;
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tokio_serde::{SymmetricallyFramed, formats::SymmetricalJson};
-use tokio_util::codec::{Decoder, FramedRead, FramedWrite, LengthDelimitedCodec};
-use bytes::BytesMut;
 use uuid::Uuid;
 
 mod process;
 
 #[derive(Debug, Deserialize)]
-struct Upload {
+pub struct Upload {
     filename: PathBuf,
     path: PathBuf,
     contents: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
-struct Run {
-    target: PathBuf,
-    working_dir: PathBuf,
-    args: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-enum RequestKind {
+pub enum RequestKind {
     Ping,
     Upload(Upload),
-    /* it feels more and more like these two can be merged */
-    Run(Run),
-    Process(Uuid, process::Request),
+    Process(process::Request),
 }
 
 #[derive(Debug, Deserialize)]
-struct Request(Uuid, RequestKind);
+pub struct Request(Uuid, RequestKind);
 
 #[derive(Debug, Serialize)]
-enum ResponseKind {
+pub enum ResponseKind {
     Ok,
     Error(String),
-    Process(Uuid, process::Response),
+    Process(process::Response),
 }
 
 #[derive(Debug, Serialize)]
-struct Response(Uuid, ResponseKind);
+pub struct Response(Option<Uuid>, ResponseKind);
 
-
+/*
 impl<T, E: std::fmt::Display> std::convert::From<(uuid::Uuid, Result<T, E>)> for Response {
     fn from((uuid, result): (Uuid, Result<T, E>)) -> Self {
         Response(uuid, match result {
@@ -62,29 +46,7 @@ impl<T, E: std::fmt::Display> std::convert::From<(uuid::Uuid, Result<T, E>)> for
         })
     }
 }
-
-struct ProcessCodec(Uuid, process::Source);
-
-impl ProcessCodec {
-    fn new(id: Uuid, source: process::Source) -> ProcessCodec {
-        ProcessCodec(id, source)
-    }
-}
-
-impl Decoder for ProcessCodec {
-    type Item = Response;
-    type Error = io::Error;
-
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Response>, io::Error> {
-        if !buf.is_empty() {
-            let length = buf.len();
-            let response = Response(self.0, ResponseKind::Process(self.0, process::Response::Output(self.1, buf.split_to(length))));
-            Ok(Some(response))
-        } else {
-            Ok(None)
-        }
-    }
-}
+*/
 
 #[tokio::main]
 pub async fn main() {
@@ -99,149 +61,115 @@ pub async fn main() {
         let (mut socket, peer_addr) = listener.accept().await.unwrap();
 
         tokio::spawn(async move {
-            // TODO security isn't important for this application, move this hashmap out
-            // of the client and protect with RwLock?
-            let mut process_tx : HashMap<Uuid, UnboundedSender<process::Request>> = HashMap::new();
             let mut processes = FuturesUnordered::new();
-
+            /* client communication */
             let (recv, send) = socket.split();
-                
-            // Deserialize frames
             let mut requests = SymmetricallyFramed::new(
                 FramedRead::new(recv, LengthDelimitedCodec::new()),
                 SymmetricalJson::<Request>::default(),
             );
-
             let responses = SymmetricallyFramed::new(
                 FramedWrite::new(send, LengthDelimitedCodec::new()),
                 SymmetricalJson::<Response>::default(),
             );
-
             let (mut tx, rx) = futures::channel::mpsc::unbounded::<Response>();
-            
             let mut multiplex_encode_task = rx.map(|message| Ok(message)).forward(responses);
-
+            /* main client loop */
             loop {
                 tokio::select! {
                     Some((uuid, exit_result)) = processes.next() => {
-                        process_tx.remove(&uuid);
-                        let exit_result : io::Result<std::process::ExitStatus> = exit_result;
-                        // todo, exit result is not necessarily ok
-                        if let Ok(exit_result) = exit_result {
-                            let termination = if exit_result.success() {
-                                process::Response::Terminated(true)
-                            }
-                            else {
-                                process::Response::Terminated(false)
-                            };
-                            let response = Response(uuid, ResponseKind::Process(uuid, termination));
-                            if let Err(error) = tx.send(response).await {
-                                log::error!("Failed to send terminate message to client: {}", error);
-                            }
-                        }
-                        else {
-                            log::error!("process failed to exit");
+                        let exit_result : std::io::Result<std::process::ExitStatus> = exit_result;
+                        let termination = match exit_result {
+                            Ok(status) => process::Response::Terminated(status.success()),
+                            Err(_) => process::Response::Terminated(false)
+                        };
+                        let response = Response(Some(uuid), ResponseKind::Process(termination));
+                        if let Err(error) = tx.send(response).await {
+                            log::error!("Failed to send terminate message to client: {}", error);
                         }
                     },
                     result = &mut multiplex_encode_task => {
                         log::warn!("multiplex_encode_task: {:?}", result);
                     },
                     // is using next instead of try_next better here?
-                    Ok(Some(Request(uuid, request))) = requests.try_next() => {
+                    Some(request) = requests.next() => {
                         let response = match request {
-                            RequestKind::Ping => {
-                                log::info!("[{}] received ping", peer_addr);
-                                Response(uuid, ResponseKind::Ok)
-                            },
-                            RequestKind::Upload(upload) => {
-                                let file_path = upload.path.join(upload.filename);
-                                log::info!("[{}] uploaded {}", peer_addr, file_path.to_string_lossy());
-                                let contents = upload.contents;
-                                let result = tokio::fs::create_dir_all(&upload.path)
-                                    .and_then(|_| tokio::fs::write(&file_path, &contents)).await;
-                                Response(uuid, match result {
-                                    Ok(_) => ResponseKind::Ok,
-                                    Err(error) => ResponseKind::Error(error.to_string())
-                                })
-                            },
-                            RequestKind::Process(id, request) => {
-                                log::info!("[{}] request to process {}, {:?}", peer_addr, id, request);
-                                Response(uuid, match process_tx.get_mut(&id) {
-                                    Some(process_tx) => match process_tx.send(request).await {
+                            Ok(Request(uuid, request)) => match request {
+                                RequestKind::Ping => {
+                                    log::info!("[{}] ping", peer_addr);
+                                    Response(Some(uuid), ResponseKind::Ok)
+                                },
+                                RequestKind::Upload(upload) => {
+                                    let file_path = upload.path.join(upload.filename);
+                                    log::info!("[{}] uploading {}", peer_addr, file_path.to_string_lossy());
+                                    let contents = upload.contents;
+                                    let result = tokio::fs::create_dir_all(&upload.path)
+                                        .and_then(|_| tokio::fs::write(&file_path, &contents)).await;
+                                    Response(Some(uuid), match result {
                                         Ok(_) => ResponseKind::Ok,
-                                        Err(_) => ResponseKind::Error("Could not communicate with process".to_owned())
+                                        Err(error) => ResponseKind::Error(error.to_string())
+                                    })
+                                },
+                                RequestKind::Process(request) => Response(Some(uuid), match request {
+                                    process::Request::Run(run) => {
+                                        log::info!("[{}] running {:?}", peer_addr, run);
+                                        let process = process::Process::new(tx.clone(), uuid, run);
+                                        processes.push(process);
+                                        ResponseKind::Process(process::Response::Started)
                                     },
-                                    None => ResponseKind::Error("No such process".to_owned())
-                                })
-                            }
-                            RequestKind::Run(run) => {
-                                let mut process = tokio::process::Command::new(run.target)
-                                    .current_dir(run.working_dir)
-                                    .args(run.args)
-                                    .stdout(std::process::Stdio::piped())
-                                    .stderr(std::process::Stdio::piped())
-                                    .stdin(std::process::Stdio::piped())
-                                    .spawn()
-                                    .expect("failed to start process");
-
-                                /* control channel */
-                                let (proc_tx, mut proc_rx) = futures::channel::mpsc::unbounded::<process::Request>();
-                                /* stdout */
-                                let stdout = process.stdout.take().expect("could not get pipe for stdout");
-                                let stdout_stream = FramedRead::new(stdout, ProcessCodec::new(uuid, process::Source::Stdout));
-                                let mut stdout_forward = stdout_stream.forward(
-                                    tx.clone().sink_map_err(|inner| {
-                                        io::Error::new(io::ErrorKind::BrokenPipe, inner)
-                                    })
-                                ).fuse();
-                                /* stderr */
-                                let stderr = process.stderr.take().expect("could not get pipe for stderr");
-                                let stderr_stream = FramedRead::new(stderr, ProcessCodec::new(uuid, process::Source::Stderr));
-                                let mut stderr_forward = stderr_stream.forward(
-                                    tx.clone().sink_map_err(|inner| {
-                                        io::Error::new(io::ErrorKind::BrokenPipe, inner)
-                                    })
-                                ).fuse();
-                                /* stdin */
-                                let mut stdin = process.stdin.take().expect("could not get pipe for stdin");
-                                /* process loop */
-                                processes.push(async move {
-                                    let exit_result : io::Result<std::process::ExitStatus> = loop {
-                                        tokio::select! {
-                                            Some(message) = proc_rx.next() => match message {
-                                                process::Request::Write(data) => {
-                                                    if let Err(error) = stdin.write_all(&data).await {
-                                                        log::error!("[{}] failed to write to stdin: {}", peer_addr, error);
-                                                    }
-                                                },
-                                                process::Request::Kill => { 
-                                                    if let Err(error) = process.start_kill() {
-                                                        log::error!("[{}] failed to start kill: {}", peer_addr, error);
-                                                    }
-                                                }
+                                    process::Request::Write(data) => {
+                                        log::info!("[{}] writing {:?}", peer_addr, data);
+                                        let stdin = processes
+                                            .iter_mut()
+                                            .find(|process| process.uuid == uuid)
+                                            .and_then(|process| process.stdin.take());
+                                        match stdin {
+                                            Some(mut input) => {
+                                                let response = match input.write_all(data.as_ref()).await {
+                                                    Ok(_) => ResponseKind::Ok,
+                                                    Err(error) => ResponseKind::Error(error.to_string())
+                                                };
+                                                /* try to put the standard input back */
+                                                processes
+                                                    .iter_mut()
+                                                    .find(|process| process.uuid == uuid)
+                                                    .map(|process| process.stdin.get_or_insert(input));
+                                                /* return the response */
+                                                response
                                             },
-                                            _ = &mut stdout_forward => {},
-                                            _ = &mut stderr_forward => {},
-                                            // note take out stdin!
-                                            exit_result = process.wait() => {
-                                                if stdout_forward.is_terminated() &&
-                                                    stderr_forward.is_terminated() {
-                                                    break exit_result;
-                                                }
-                                            },
+                                            None => ResponseKind::Error("Standard input unavailable".to_owned())
                                         }
-                                    };
-                                    (uuid, exit_result)
-                                });
-                                /* insert the tx end of the control channel into a map*/
-                                process_tx.insert(uuid, proc_tx);
-
-                                Response(uuid, ResponseKind::Process(uuid, process::Response::Started))
-                            }
+                                    },
+                                    process::Request::Signal(number) => {
+                                        log::info!("[{}] signaling {:?}", peer_addr, number);
+                                        let pid = processes
+                                            .iter()
+                                            .find(|process| process.uuid == uuid)
+                                            .and_then(|process| process.pid);
+                                        match pid {
+                                            Some(pid) => {
+                                                let process = tokio::process::Command::new("kill")
+                                                    .arg(format!("-{}", number))    
+                                                    .arg(format!("{}", pid))
+                                                    .output();
+                                                match process.await {
+                                                    Ok(std::process::Output {status, ..}) => match status.code() {
+                                                        Some(0) => ResponseKind::Ok,
+                                                        Some(code) => ResponseKind::Error(format!("signal terminated with {}", code)),
+                                                        None => ResponseKind::Error(format!("signal terminated without code"))
+                                                    },
+                                                    Err(error) => ResponseKind::Error(error.to_string()),
+                                                }
+                                            },
+                                            None => ResponseKind::Error("Could not find process".to_owned())
+                                        }
+                                    }
+                                })
+                            },
+                            Err(error) => Response(None, ResponseKind::Error(error.to_string()))
                         };
-
                         if let Err(error) = tx.send(response).await {
-                            eprintln!("Error = {}", error);
+                            log::error!("{}", error.to_string());
                         }
                     }
                 } // select
