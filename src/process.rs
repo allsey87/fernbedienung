@@ -21,7 +21,7 @@ pub struct Run {
 #[derive(Debug, Deserialize)]
 pub enum Request {
     Run(Run),
-    Write(Vec<u8>),
+    StandardInput(BytesMut),
     Signal(u32),
 }
 
@@ -29,7 +29,8 @@ pub enum Request {
 pub enum Response {
     Started,
     Terminated(bool),
-    Output(Source, BytesMut),
+    StandardOutput(BytesMut),
+    StandardError(BytesMut),
 }
 
 struct Codec(Uuid, Source);
@@ -46,9 +47,17 @@ impl Decoder for Codec {
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<crate::Response>, io::Error> {
         if !buf.is_empty() {
+            let Self(uuid, source) = self;
             let length = buf.len();
-            let response = crate::Response(Some(self.0), crate::ResponseKind::Process(Response::Output(self.1, buf.split_to(length))));
-            Ok(Some(response))
+            let response = crate::ResponseKind::Process(match source {
+                Source::Stdout => {
+                    Response::StandardOutput(buf.split_to(length))
+                },
+                Source::Stderr => {
+                    Response::StandardError(buf.split_to(length))
+                }
+            });
+            Ok(Some(crate::Response(Some(uuid.clone()), response)))
         } else {
             Ok(None)
         }

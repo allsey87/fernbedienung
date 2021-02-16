@@ -48,7 +48,7 @@ pub async fn main() {
 
     loop {
         let (mut socket, peer_addr) = listener.accept().await.unwrap();
-        log::info!("accepted connection from {}", peer_addr);
+        log::info!("[{}] connected", peer_addr);
         tokio::spawn(async move {
             let mut processes = FuturesUnordered::new();
             /* client communication */
@@ -89,11 +89,11 @@ pub async fn main() {
                         },
                         /* at this point it is probably the case that the client has disconnected */
                         None => break
-                    } // Some(request) = requests.next() => {
-                } // select
+                    }
+                }
             }
-            log::info!("discconected from {}", peer_addr);
-        }); // tokio::spawn
+            log::info!("[{}] disconnected", peer_addr);
+        });
     }
 }
 
@@ -125,7 +125,7 @@ async fn handle_client_request(request: std::io::Result<Request>,
                     processes.push(process);
                     ResponseKind::Process(process::Response::Started)
                 },
-                process::Request::Write(data) => {
+                process::Request::StandardInput(data) => {
                     log::info!("[{}] writing {:?}", peer_addr, data);
                     let stdin = processes
                         .iter_mut()
